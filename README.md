@@ -1,3 +1,5 @@
+![logo](pictures/logo.png)
+
 # Telegram Smart Search
 
 Turn your Telegram history into a private, semantic, multimodal knowledge base. Text, images, voice notes, and files become searchable by meaning — with a local privacy layer that masks sensitive data before anything is embedded or stored.
