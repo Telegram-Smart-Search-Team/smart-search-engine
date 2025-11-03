@@ -1,0 +1,9 @@
+[project]
+name = "smart-search-engine"
+version = "0.1.0"
+description = "Turn your Telegram history into a private, semantic, multimodal knowledge base."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "ruff>=0.14.3",
+]
