@@ -1,10 +1,12 @@
 # mocks.py
 
+
 class MockBot:
     """
     A mock implementation of the Bot to simulate user interaction
     for testing the Retriever.
     """
+
     def __init__(self):
         self.tracked_chats = set()
         print("MockBot initialized.")
@@ -41,6 +43,7 @@ class MockClient:
     A mock implementation of the Client to simulate new messages
     for testing the Dumper.
     """
+
     def __init__(self):
         self.is_logging_active = True
         print("MockClient initialized.")

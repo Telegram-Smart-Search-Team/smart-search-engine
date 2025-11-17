@@ -5,6 +5,7 @@ from logging import getLogger
 
 logger = getLogger("chromadb_wrapper")
 
+
 class VectorDB:
     """
     API for interacting with ChromaDB.
@@ -38,7 +39,9 @@ class VectorDB:
         try:
             self.client = chromadb.HttpClient(host=host, port=port)
             self._collection = self.client.get_or_create_collection(name=collection_name)
-            logger.info(f"Successfully connected to ChromaDB at {host}:{port} and loaded collection '{collection_name}'.")
+            logger.info(
+                f"Successfully connected to ChromaDB at {host}:{port} and loaded collection '{collection_name}'."
+            )
         except Exception:
             logger.exception("Error connecting to ChromaDB")
             raise
@@ -56,7 +59,7 @@ class VectorDB:
         content: str,
         embedding: List[float],
         message_type: str,
-        retrieved_text_if_image: Optional[str] = None
+        retrieved_text_if_image: Optional[str] = None,
     ) -> None:
         """
         Adds or updates a single message in the vector database.
@@ -85,21 +88,14 @@ class VectorDB:
             metadata["retrieved_text_if_image"] = retrieved_text_if_image
 
         try:
-            self._collection.add(
-                ids=[doc_id],
-                embeddings=[embedding],
-                metadatas=[metadata]
-            )
+            self._collection.add(ids=[doc_id], embeddings=[embedding], metadatas=[metadata])
             logger.info(f"Added/updated message with ID {doc_id}.")
         except Exception:
             logger.exception(f"Error adding message {doc_id}")
             raise
 
     def search_similar(
-        self,
-        query_embedding: List[float],
-        top_k: int = 5,
-        allowed_chat_ids: Optional[List[int]] = None
+        self, query_embedding: List[float], top_k: int = 5, allowed_chat_ids: Optional[List[int]] = None
     ) -> List[Dict[str, Any]]:
         """
         Searches for the top_k most similar messages to a given query embedding.
@@ -125,19 +121,17 @@ class VectorDB:
 
         try:
             results = self._collection.query(
-                query_embeddings=[query_embedding],
-                n_results=top_k,
-                where=where_filter if where_filter else None
+                query_embeddings=[query_embedding], n_results=top_k, where=where_filter if where_filter else None
             )
 
             # Format the output to be clean and easy to use
             formatted_results = []
-            if results and results['ids'][0]:
-                for i, doc_id in enumerate(results['ids'][0]):
+            if results and results["ids"][0]:
+                for i, doc_id in enumerate(results["ids"][0]):
                     candidate = {
                         "id": doc_id,
-                        "metadata": results['metadatas'][0][i],
-                        "distance": results['distances'][0][i] # cos_distance
+                        "metadata": results["metadatas"][0][i],
+                        "distance": results["distances"][0][i],  # cos_distance
                     }
                     formatted_results.append(candidate)
             logger.info(f"Found {len(formatted_results)} candidates for the query.")
@@ -146,10 +140,12 @@ class VectorDB:
             logger.warning(f"Failure during search: {e}")
             return []
 
+
 # --- Example Usage ---
-if __name__ == '__main__':
+if __name__ == "__main__":
     # This demonstrates how the components would interact in a test scenario.
     from mocks import MockBot, MockClient
+
     # 1. Initialize mocks and the DB API
     # Assumes a ChromaDB instance is running on localhost:8000
     try:
@@ -158,30 +154,42 @@ if __name__ == '__main__':
         client = MockClient()
 
         # 2. Simulate client receiving messages (would trigger Dumper)
-        client.simulate_new_message({
-            "message_id": 101, "chat_id": -1001, "author_id": 123,
-            "content": "Can someone explain the new ruff style guide?",
-            "type": "text"
-        })
+        client.simulate_new_message(
+            {
+                "message_id": 101,
+                "chat_id": -1001,
+                "author_id": 123,
+                "content": "Can someone explain the new ruff style guide?",
+                "type": "text",
+            }
+        )
         # Dumper would process this and call db_api.add_message()
         # Let's simulate that call:
         db_api.add_message(
-            message_id=101, chat_id=-1001, author_id=123,
+            message_id=101,
+            chat_id=-1001,
+            author_id=123,
             content="Can someone explain the new ruff style guide?",
             embedding=[0.1, 0.2, 0.9] * 512,  # Dummy embedding
-            message_type="text"
+            message_type="text",
         )
 
-        client.simulate_new_message({
-            "message_id": 102, "chat_id": -1001, "author_id": 456,
-            "content": "I think the new QWEN model is very powerful.",
-            "type": "text"
-        })
+        client.simulate_new_message(
+            {
+                "message_id": 102,
+                "chat_id": -1001,
+                "author_id": 456,
+                "content": "I think the new QWEN model is very powerful.",
+                "type": "text",
+            }
+        )
         db_api.add_message(
-            message_id=102, chat_id=-1001, author_id=456,
+            message_id=102,
+            chat_id=-1001,
+            author_id=456,
             content="I think the new QWEN model is very powerful.",
             embedding=[0.8, 0.7, 0.1] * 512,  # Dummy embedding
-            message_type="text"
+            message_type="text",
         )
 
         # 3. Simulate a user sending a search query to the bot (triggers Retriever)
@@ -193,17 +201,17 @@ if __name__ == '__main__':
         query_embedding = [0.7, 0.6, 0.2] * 512  # Dummy embedding for the query
         logger.info(f"Searching DB for query: '{user_query}'")
         candidates = db_api.search_similar(
-            query_embedding=query_embedding,
-            top_k=1,
-            allowed_chat_ids=list(bot.tracked_chats)
+            query_embedding=query_embedding, top_k=1, allowed_chat_ids=list(bot.tracked_chats)
         )
         logger.info(f"Received candidates: {candidates}")
 
         # 4. Retriever processes candidates and sends to Generator, then to Bot
         if candidates:
-            final_summary = f"Based on the conversation, the key point about models is: '{candidates[0]['metadata']['content']}'"
+            final_summary = (
+                f"Based on the conversation, the key point about models is: '{candidates[0]['metadata']['content']}'"
+            )
             bot.send_answer_to_user(final_summary)
 
     except Exception:
-        logger.exception(f"\nCould not run example. Please ensure ChromaDB is running and accessible.")
+        logger.exception("\nCould not run example. Please ensure ChromaDB is running and accessible.")
         raise
