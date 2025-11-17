@@ -1,9 +1,10 @@
 import chromadb
 from chromadb.types import Collection
 from typing import List, Dict, Any, Optional
-from logging import getLogger
+import logging
 
-logger = getLogger("chromadb_wrapper")
+logging.basicConfig(level=logging.DEBUG, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+logger = logging.getLogger("chromadb_wrapper")
 
 
 class VectorDB:
