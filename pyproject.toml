@@ -5,6 +5,7 @@ description = "Turn your Telegram history into a private, semantic, multimodal k
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "chromadb>=1.3.4",
     "ruff>=0.14.3",
 ]
 
