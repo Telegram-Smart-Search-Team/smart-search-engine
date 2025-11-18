@@ -1,0 +1,1864 @@
+Nice, glad it actually works and you like the design.
+
+Below are **full updated versions** of the files that need changes, with all 7 points implemented.
+
+Changed files:
+
+1. `telegram_config_panel/settings.py`
+2. `panel/telegram_service.py`
+3. `panel/templates/panel/index.html`
+4. `client.py`
+
+---
+
+## 1) `telegram_config_panel/settings.py`
+
+Full file (adapt to your project path if needed):
+
+```python
+from pathlib import Path
+import os
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+
+# --- Core Django settings ---
+
+SECRET_KEY = os.getenv("DJANGO_SECRET_KEY", "dev-only-secret-key")
+DEBUG = True
+ALLOWED_HOSTS = ["*"]
+
+INSTALLED_APPS = [
+    "django.contrib.admin",
+    "django.contrib.auth",
+    "django.contrib.contenttypes",
+    "django.contrib.sessions",
+    "django.contrib.messages",
+    "django.contrib.staticfiles",
+    "panel",
+]
+
+MIDDLEWARE = [
+    "django.middleware.security.SecurityMiddleware",
+    "django.contrib.sessions.middleware.SessionMiddleware",
+    "django.middleware.common.CommonMiddleware",
+    "django.middleware.csrf.CsrfViewMiddleware",
+    "django.contrib.auth.middleware.AuthenticationMiddleware",
+    "django.contrib.messages.middleware.MessageMiddleware",
+    "django.middleware.clickjacking.XFrameOptionsMiddleware",
+]
+
+ROOT_URLCONF = "telegram_config_panel.urls"
+
+TEMPLATES = [
+    {
+        "BACKEND": "django.template.backends.django.DjangoTemplates",
+        "DIRS": [BASE_DIR / "panel" / "templates"],
+        "APP_DIRS": True,
+        "OPTIONS": {
+            "context_processors": [
+                "django.template.context_processors.debug",
+                "django.template.context_processors.request",
+                "django.contrib.auth.context_processors.auth",
+                "django.contrib.messages.context_processors.messages",
+            ],
+        },
+    },
+]
+
+WSGI_APPLICATION = "telegram_config_panel.wsgi.application"
+ASGI_APPLICATION = "telegram_config_panel.asgi.application"
+
+# --- DB (simple sqlite for this panel) ---
+
+DATABASES = {
+    "default": {
+        "ENGINE": "django.db.backends.sqlite3",
+        "NAME": BASE_DIR / "db.sqlite3",
+    }
+}
+
+LANGUAGE_CODE = "en-us"
+TIME_ZONE = "UTC"
+USE_I18N = True
+USE_TZ = True
+
+STATIC_URL = "/static/"
+STATICFILES_DIRS = [BASE_DIR / "panel" / "static"]
+
+MEDIA_URL = "/media/"
+MEDIA_ROOT = BASE_DIR / "media"
+
+DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
+
+# --- Redis / Telethon / Telegram-specific config ---
+
+REDIS_URL = os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0")
+
+# Django-side Telethon client (for metadata fetching)
+DJANGO_CLIENT_APP_API_ID = int(os.getenv("CLIENT_APP_API_ID", "0"))
+DJANGO_CLIENT_APP_API_HASH = os.getenv("CLIENT_APP_API_HASH", "")
+DJANGO_SESSION_PATH = os.getenv(
+    "DJANGO_SESSION_PATH",
+    str((BASE_DIR.parent.parent / "django_session.session").resolve()),
+)
+
+TELEGRAM_MEDIA_SUBDIR = "telegram_media"  # under MEDIA_ROOT
+
+# --- Bot user id (parsed from BOT_TOKEN) ---
+
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+BOT_USER_ID = None
+if BOT_TOKEN:
+    # bot token format: "<id>:<rest>"
+    try:
+        BOT_USER_ID = int(BOT_TOKEN.split(":", 1)[0])
+    except (ValueError, IndexError):
+        BOT_USER_ID = None
+
+# --- Client (self) user id for "Saved Messages" detection ---
+
+CLIENT_USER_ID = None
+if DJANGO_CLIENT_APP_API_ID and DJANGO_CLIENT_APP_API_HASH:
+    try:
+        # One-time synchronous fetch of "me" to know our own user id.
+        from telethon.sync import TelegramClient  # type: ignore
+
+        with TelegramClient(
+            DJANGO_SESSION_PATH,
+            DJANGO_CLIENT_APP_API_ID,
+            DJANGO_CLIENT_APP_API_HASH,
+        ) as tclient:
+            me = tclient.get_me()
+            if me:
+                CLIENT_USER_ID = me.id
+    except Exception:
+        CLIENT_USER_ID = None
+```
+
+---
+
+## 2) `panel/telegram_service.py`
+
+Full file with:
+
+* New-chats config auto-write (point 2).
+* Avatar resize to 40×40 (point 3).
+* BOT_USER_ID skip (point 4).
+* Saved Messages special handling (point 5).
+* Fixed `ensure_emoji_png(client, ...)` signature.
+
+```python
+import asyncio
+import datetime
+import os
+import pathlib
+from typing import Any, Dict, List, Tuple
+
+from django.conf import settings
+
+from telethon import TelegramClient, types
+from telethon.utils import get_peer_id
+from telethon.tl.functions.messages import (
+    GetForumTopicsRequest,
+    GetCustomEmojiDocumentsRequest,
+)
+
+from .config_store import default_sources_config, save_config_and_publish
+
+BASE_DIR = settings.BASE_DIR
+MEDIA_ROOT = pathlib.Path(settings.MEDIA_ROOT)
+MEDIA_ROOT.mkdir(parents=True, exist_ok=True)
+
+TELEGRAM_MEDIA_DIR = MEDIA_ROOT / settings.TELEGRAM_MEDIA_SUBDIR
+TELEGRAM_MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+
+# Icon for "Saved Messages" (pre-resized 40x40, as you mentioned)
+SAVED_MESSAGES_ICON_PATH = MEDIA_ROOT / "saved_messages.jpg"
+
+CLIENT_APP_API_ID = int(settings.DJANGO_CLIENT_APP_API_ID)
+CLIENT_APP_API_HASH = settings.DJANGO_CLIENT_APP_API_HASH
+SESSION_PATH = settings.DJANGO_SESSION_PATH
+
+BOT_USER_ID = getattr(settings, "BOT_USER_ID", None)
+CLIENT_USER_ID = getattr(settings, "CLIENT_USER_ID", None)
+
+# emoji_id -> png_path (in-memory cache for this process)
+emoji_png_cache: Dict[int, str] = {}
+
+CONCURRENT_CONVERSIONS = 4
+conversion_semaphore = asyncio.Semaphore(CONCURRENT_CONVERSIONS)
+
+AVATAR_SIZE = (40, 40)  # px
+
+
+def _make_client() -> TelegramClient:
+    """
+    New client per call. Keeps lifecycle simple.
+    """
+    return TelegramClient(SESSION_PATH, CLIENT_APP_API_ID, CLIENT_APP_API_HASH)
+
+
+# ---------- type helpers ----------
+
+
+def _chat_type_from_entity(entity: types.Entity) -> str:
+    from telethon.tl.types import User, Chat, Channel
+
+    if isinstance(entity, User):
+        return "bot" if entity.bot else "personal"
+    if isinstance(entity, Chat):
+        return "group"
+    if isinstance(entity, Channel):
+        is_supergroup = bool(entity.megagroup)
+        is_forum = bool(getattr(entity, "forum", False))
+        if is_supergroup and is_forum:
+            return "matryoshka_group"
+        if is_supergroup:
+            return "group"
+        return "channel"
+    return "unknown"
+
+
+def _title_from_entity(entity: types.Entity) -> str:
+    from telethon.tl.types import User, Chat, Channel
+
+    if isinstance(entity, User):
+        name = " ".join(x for x in [entity.first_name, entity.last_name] if x)
+        return name or (entity.username or f"User {entity.id}")
+    if isinstance(entity, (Chat, Channel)):
+        return entity.title or (getattr(entity, "username", None) or f"Chat {entity.id}")
+    return "Unknown"
+
+
+def _count_tracked_sources(cfg: Dict[str, Any]) -> int:
+    return (
+        int(cfg.get("track_text", False))
+        + int(cfg.get("track_image", False))
+        + int(cfg.get("track_video", False))
+        + int(cfg.get("track_audio", False))
+        + int(cfg.get("track_files", False))
+    )
+
+
+def _peer_config_key(peer_id: int) -> str:
+    return f"peer:{peer_id}"
+
+
+def _topic_config_key(peer_id: int, topic_id: int) -> str:
+    return f"topic:{peer_id}:{topic_id}"
+
+
+def _media_url_from_path(path: str | None) -> str | None:
+    if not path:
+        return None
+    p = pathlib.Path(path).resolve()
+    try:
+        rel = p.relative_to(MEDIA_ROOT)
+    except ValueError:
+        return None
+    return settings.MEDIA_URL.rstrip("/") + "/" + str(rel).replace(os.sep, "/")
+
+
+# ---------- avatar + emoji PNG helpers ----------
+
+
+async def download_chat_photo(client: TelegramClient, entity: types.Entity) -> str | None:
+    """
+    Download chat's profile photo, resize to 40x40, and return local path.
+    """
+    from PIL import Image  # local import to avoid unnecessary import at module level
+
+    peer_id = get_peer_id(entity)
+    filename = TELEGRAM_MEDIA_DIR / f"chat_{peer_id}.jpg"
+
+    try:
+        path = await client.download_profile_photo(entity, file=str(filename))
+        if not path:
+            return None
+
+        try:
+            img = Image.open(path)
+            img = img.resize(AVATAR_SIZE, Image.LANCZOS)
+            img.save(path, format="JPEG", quality=85)
+        except Exception:
+            # If resize fails, just keep original file.
+            pass
+
+        return path
+    except Exception:
+        return None
+
+
+async def ensure_emoji_png(
+    client: TelegramClient,
+    emoji_id: int,
+    doc: types.Document,
+) -> str | None:
+    """
+    Convert custom emoji document to PNG in TELEGRAM_MEDIA_DIR.
+
+    Supports:
+      - image/webp
+      - application/x-tgsticker (via lottie_convert.py)
+      - video/webm (via ffmpeg)
+      - any other format is saved as-is
+    """
+    if emoji_id in emoji_png_cache:
+        return emoji_png_cache[emoji_id]
+
+    base = TELEGRAM_MEDIA_DIR / f"emoji_{emoji_id}"
+    png_path = base.with_suffix(".png")
+
+    # fast path: already converted
+    if png_path.exists():
+        emoji_png_cache[emoji_id] = str(png_path)
+        return str(png_path)
+
+    raw_path_str = await client.download_media(doc, file=str(base))
+    if raw_path_str is None:
+        return None
+
+    raw_path = pathlib.Path(raw_path_str)
+    mime = doc.mime_type or ""
+
+    async with conversion_semaphore:
+        if mime == "image/webp":
+            from PIL import Image
+
+            def _convert_webp():
+                img = Image.open(raw_path)
+                img.save(png_path)
+
+            await asyncio.to_thread(_convert_webp)
+            emoji_png_cache[emoji_id] = str(png_path)
+            return str(png_path)
+
+        elif mime == "application/x-tgsticker":
+            # .tgs → PNG (first frame) via lottie_convert.py
+            proc = await asyncio.create_subprocess_exec(
+                "lottie_convert.py",
+                str(raw_path),
+                str(png_path),
+                "--frame",
+                "0",
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await proc.wait()
+            if proc.returncode == 0 and png_path.exists():
+                emoji_png_cache[emoji_id] = str(png_path)
+                return str(png_path)
+            emoji_png_cache[emoji_id] = str(raw_path)
+            return str(raw_path)
+
+        elif mime == "video/webm":
+            # video emoji → PNG first frame via ffmpeg
+            proc = await asyncio.create_subprocess_exec(
+                "ffmpeg",
+                "-y",
+                "-i",
+                str(raw_path),
+                "-vframes",
+                "1",
+                str(png_path),
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await proc.wait()
+            if proc.returncode == 0 and png_path.exists():
+                emoji_png_cache[emoji_id] = str(png_path)
+                return str(png_path)
+            emoji_png_cache[emoji_id] = str(raw_path)
+            return str(raw_path)
+
+        else:
+            emoji_png_cache[emoji_id] = str(raw_path)
+            return str(raw_path)
+
+
+async def fetch_emoji_docs_for_topics(
+    client: TelegramClient,
+    topics: List[types.ForumTopic],
+) -> Dict[int, types.Document]:
+    emoji_ids = {
+        getattr(t, "icon_emoji_id", None)
+        for t in topics
+    }
+    emoji_ids = {e for e in emoji_ids if e}
+
+    if not emoji_ids:
+        return {}
+
+    docs = await client(GetCustomEmojiDocumentsRequest(document_id=list(emoji_ids)))
+
+    mapping: Dict[int, types.Document] = {}
+    for doc in docs:
+        doc_id = getattr(doc, "id", None)
+        if doc_id is not None:
+            mapping[doc_id] = doc
+    return mapping
+
+
+async def get_all_forum_topics(
+    client: TelegramClient,
+    peer: types.Channel,
+) -> List[types.ForumTopic]:
+    topics: List[types.ForumTopic] = []
+
+    offset_date = datetime.datetime(1970, 1, 1)
+    offset_id = 0
+    offset_topic = 0
+    total = None
+
+    while True:
+        resp = await client(
+            GetForumTopicsRequest(
+                peer=peer,
+                offset_date=offset_date,
+                offset_id=offset_id,
+                offset_topic=offset_topic,
+                limit=100,
+            )
+        )
+
+        if total is None:
+            total = resp.count
+
+        if not resp.topics:
+            break
+
+        topics.extend(resp.topics)
+
+        if len(topics) >= total:
+            break
+
+        last = resp.topics[-1]
+        offset_topic = last.id
+        offset_id = last.top_message
+
+        msg_dates = {m.id: m.date for m in resp.messages}
+        offset_date = msg_dates.get(offset_id, offset_date)
+
+    return topics
+
+
+async def build_matryoshka_details(
+    client: TelegramClient,
+    entity: types.Channel,
+    config: Dict[str, Any],
+) -> Tuple[str | None, List[Dict[str, Any]]]:
+    """
+    Returns (group_photo_path, subchats_list)
+    subchats_list: [{chat_key, title, icon_url, config, topic_id}, ...]
+    """
+    group_peer_id = get_peer_id(entity)
+    group_photo_path = await download_chat_photo(client, entity)
+
+    topics = await get_all_forum_topics(client, entity)
+    if not topics:
+        return group_photo_path, []
+
+    emoji_docs = await fetch_emoji_docs_for_topics(client, topics)
+
+    emoji_png_paths: Dict[int, str | None] = {}
+
+    async def _convert_one(eid: int, doc: types.Document):
+        try:
+            path = await ensure_emoji_png(client, eid, doc)
+            return eid, path
+        except Exception:
+            return eid, None
+
+    tasks = [_convert_one(eid, doc) for eid, doc in emoji_docs.items()]
+    if tasks:
+        results = await asyncio.gather(*tasks)
+        for eid, path in results:
+            emoji_png_paths[eid] = path
+
+    subchats: List[Dict[str, Any]] = []
+    chats_cfg = config.get("chats", {})
+
+    for t in topics:
+        topic_id = t.id
+        title = t.title or f"Topic {topic_id}"
+        icon_emoji_id = getattr(t, "icon_emoji_id", None)
+
+        icon_file = None
+        if icon_emoji_id:
+            icon_file = emoji_png_paths.get(icon_emoji_id)
+
+        key = _topic_config_key(group_peer_id, topic_id)
+        cfg = chats_cfg.get(key, default_sources_config())
+
+        subchats.append(
+            {
+                "chat_key": key,
+                "topic_id": topic_id,
+                "title": title,
+                "icon_url": _media_url_from_path(icon_file) if icon_file else None,
+                "config": cfg,
+                "parent_peer_id": group_peer_id,
+            }
+        )
+
+    return group_photo_path, subchats
+
+
+# ---------- bootstrap: chat list + ordering ----------
+
+
+async def fetch_chat_entries(
+    config: Dict[str, Any],
+) -> Tuple[List[Dict[str, Any]], bool]:
+    """
+    Return top-level entries (plain chats + matryoshka groups), and a flag
+    indicating whether we modified the config by adding default entries
+    for previously unseen chats.
+    """
+    client = _make_client()
+    entries: List[Dict[str, Any]] = []
+    chats_cfg = config.setdefault("chats", {})
+    changed = False
+
+    async with client:
+        async for dialog in client.iter_dialogs():
+            entity = dialog.entity
+            peer_id = get_peer_id(entity)
+
+            # Skip the bot used for queries (we never want to track it)
+            if BOT_USER_ID is not None and peer_id == BOT_USER_ID:
+                continue
+
+            chat_type = _chat_type_from_entity(entity)
+            entry_id = _peer_config_key(peer_id)
+            title = _title_from_entity(entity)
+
+            # "Saved Messages" special case
+            if CLIENT_USER_ID is not None and peer_id == CLIENT_USER_ID:
+                title = "Saved Messages"
+
+            if entry_id in chats_cfg:
+                cfg = chats_cfg[entry_id]
+                any_cfg = any(cfg.values())
+                is_new = False
+            else:
+                # Brand new chat: show as "new" once, but immediately
+                # add default (all False) config and persist later.
+                cfg = default_sources_config()
+                chats_cfg[entry_id] = cfg
+                any_cfg = False
+                is_new = True
+                changed = True
+
+            tracked_count = _count_tracked_sources(cfg)
+
+            # For matryoshka groups, consider topics' configs as well.
+            if chat_type == "matryoshka_group":
+                max_child = 0
+                has_any_topic_cfg = False
+                prefix = f"topic:{peer_id}:"
+                for key, val in chats_cfg.items():
+                    if key.startswith(prefix):
+                        has_any_topic_cfg = True
+                        c = _count_tracked_sources(val)
+                        if c > max_child:
+                            max_child = c
+                if max_child > tracked_count:
+                    tracked_count = max_child
+                any_cfg = any_cfg or has_any_topic_cfg
+
+            entries.append(
+                {
+                    "entry_id": entry_id,
+                    "peer_id": peer_id,
+                    "title": title,
+                    "chat_type": chat_type,
+                    "tracked_sources_count": tracked_count,
+                    "is_new": is_new,
+                }
+            )
+
+    # Sort: new chats first, then by tracked sources desc, then title
+    entries.sort(
+        key=lambda e: (
+            0 if e["is_new"] else 1,
+            -e["tracked_sources_count"],
+            e["title"].lower(),
+        )
+    )
+    return entries, changed
+
+
+async def build_bootstrap_payload(config: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Build bootstrap payload:
+      - possibly extend config with "new" chats (default config all False)
+      - return chat_order + meta for frontend.
+    """
+    entries, changed = await fetch_chat_entries(config)
+    if changed:
+        # Save config so "new" chats are only new once
+        save_config_and_publish(config)
+
+    chat_order = [e["entry_id"] for e in entries]
+
+    meta = {
+        e["entry_id"]: {
+            "peer_id": e["peer_id"],
+            "title": e["title"],
+            "chat_type": e["chat_type"],
+            "is_new": e["is_new"],
+            "tracked_sources_count": e["tracked_sources_count"],
+        }
+        for e in entries
+    }
+
+    return {
+        "chat_order": chat_order,
+        "meta": meta,
+    }
+
+
+# ---------- batch fetch ----------
+
+
+async def fetch_batch_details(
+    entry_ids: List[str],
+    config: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """
+    Given entry_ids like ["peer:-100123", "peer:1234", ...],
+    fetch fresh info from Telegram (title, avatar, forum topics).
+    """
+    client = _make_client()
+    results: List[Dict[str, Any]] = []
+    chats_cfg = config.get("chats", {})
+
+    async with client:
+        for entry_id in entry_ids:
+            if not entry_id.startswith("peer:"):
+                continue
+
+            peer_id = int(entry_id.split(":", 1)[1])
+
+            # Defensive: skip bot chat even if requested
+            if BOT_USER_ID is not None and peer_id == BOT_USER_ID:
+                continue
+
+            entity = await client.get_entity(peer_id)
+            chat_type = _chat_type_from_entity(entity)
+            title = _title_from_entity(entity)
+
+            if CLIENT_USER_ID is not None and peer_id == CLIENT_USER_ID:
+                title = "Saved Messages"
+
+            is_forum = chat_type == "matryoshka_group"
+            cfg = chats_cfg.get(entry_id, default_sources_config())
+
+            if is_forum and isinstance(entity, types.Channel):
+                group_photo_path, subchats = await build_matryoshka_details(
+                    client, entity, config
+                )
+                avatar_url = _media_url_from_path(group_photo_path)
+            else:
+                # Saved Messages icon override
+                if (
+                    CLIENT_USER_ID is not None
+                    and peer_id == CLIENT_USER_ID
+                    and SAVED_MESSAGES_ICON_PATH.exists()
+                ):
+                    avatar_url = _media_url_from_path(str(SAVED_MESSAGES_ICON_PATH))
+                else:
+                    avatar_path = await download_chat_photo(client, entity)
+                    avatar_url = _media_url_from_path(avatar_path)
+                subchats = []
+
+            results.append(
+                {
+                    "entry_id": entry_id,
+                    "peer_id": peer_id,
+                    "title": title,
+                    "chat_type": chat_type,
+                    "avatar_url": avatar_url,
+                    "chat_key": entry_id,
+                    "config": cfg,
+                    "subchats": subchats,
+                }
+            )
+
+    return results
+```
+
+---
+
+## 3) `panel/templates/panel/index.html`
+
+Full template with:
+
+* No page reload on save.
+* Inline update of icons + tracked count (point 1).
+* Extra bottom margin for list (point 6).
+* Better toggle interaction & hover (point 7).
+* Your fixed toggle creation logic.
+
+```html
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <title>Telegram Smart Search – Config</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <style>
+    :root {
+      --bg: #000;
+      --fg: #ddd;
+      --accent: #888;
+      --accent-strong: #4ade80;
+      --error: #f97373;
+      --card-bg: rgba(255,255,255,0.02);
+      --card-border: rgba(255,255,255,0.08);
+    }
+    html, body {
+      margin:0; padding:0;
+      height:100%;
+      background: var(--bg);
+      color: var(--fg);
+      font: 14px/1.4 system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Arial;
+    }
+    body {
+      display:flex;
+      justify-content:center;
+    }
+    .page {
+      width:100%;
+      max-width:900px;
+      padding:32px 16px 48px;
+    }
+    .header {
+      display:flex;
+      justify-content:space-between;
+      align-items:center;
+      margin-bottom:24px;
+    }
+    .title {
+      font-size:20px;
+      font-weight:600;
+    }
+    .subtitle {
+      font-size:13px;
+      opacity:.7;
+    }
+    .pill {
+      border-radius:999px;
+      padding:4px 10px;
+      border:1px solid rgba(255,255,255,0.15);
+      background:rgba(255,255,255,0.03);
+      font-size:12px;
+      opacity:.9;
+    }
+
+    .chat-list {
+      display:flex;
+      flex-direction:column;
+      gap:8px;
+      margin-bottom:72px; /* extra space at bottom */
+    }
+    .chat-row {
+      display:flex;
+      align-items:center;
+      gap:12px;
+      padding:10px 12px;
+      border-radius:12px;
+      border:1px solid var(--card-border);
+      background:var(--card-bg);
+      backdrop-filter:saturate(120%) blur(3px);
+    }
+    .chat-row.new {
+      border-color:rgba(250,250,250,0.28);
+    }
+    .chat-row .avatar-wrap {
+      width:40px;
+      height:40px;
+      border-radius:50%;
+      overflow:hidden;
+      flex-shrink:0;
+      background:radial-gradient(circle at 30% 20%, #555, #111);
+      display:flex;
+      align-items:center;
+      justify-content:center;
+      font-size:18px;
+      color:#bbb;
+    }
+    .chat-row img.avatar {
+      width:100%;
+      height:100%;
+      object-fit:cover;
+      display:block;
+    }
+    .chat-main {
+      flex:1;
+      min-width:0;
+      display:flex;
+      flex-direction:column;
+      gap:4px;
+    }
+    .chat-title {
+      font-size:14px;
+      white-space:nowrap;
+      overflow:hidden;
+      text-overflow:ellipsis;
+    }
+    .chat-meta {
+      display:flex;
+      align-items:center;
+      gap:8px;
+      font-size:11px;
+      opacity:.7;
+    }
+    .chat-meta .badge {
+      padding:2px 6px;
+      border-radius:999px;
+      border:1px solid rgba(255,255,255,0.16);
+    }
+    .sources-row {
+      display:flex;
+      align-items:center;
+      gap:6px;
+      font-size:12px;
+    }
+    .source-icon {
+      width:18px;
+      height:18px;
+      border-radius:50%;
+      display:flex;
+      align-items:center;
+      justify-content:center;
+      border:1px solid rgba(255,255,255,0.18);
+      opacity:.4;
+      font-size:11px;
+    }
+    .source-icon.active {
+      opacity:1;
+      border-color:var(--accent-strong);
+      box-shadow:0 0 0 1px rgba(74,222,128,0.35);
+    }
+    .btn {
+      border-radius:999px;
+      padding:6px 12px;
+      border:1px solid rgba(255,255,255,0.16);
+      background:rgba(255,255,255,0.02);
+      color:var(--fg);
+      font-size:12px;
+      cursor:pointer;
+      display:inline-flex;
+      align-items:center;
+      gap:6px;
+    }
+    .btn:hover {
+      border-color:rgba(255,255,255,0.32);
+      background:rgba(255,255,255,0.06);
+    }
+    .btn-primary {
+      border-color:var(--accent-strong);
+      background:rgba(74,222,128,0.12);
+    }
+
+    .matryoshka-toggle {
+      cursor:pointer;
+      display:flex;
+      align-items:center;
+      gap:6px;
+    }
+    .matryoshka-arrow {
+      width:18px;
+      height:18px;
+      border-radius:999px;
+      border:1px solid rgba(255,255,255,0.16);
+      display:flex;
+      align-items:center;
+      justify-content:center;
+      font-size:11px;
+      transition:transform .15s ease;
+    }
+    .matryoshka-arrow.open {
+      transform:rotate(90deg);
+    }
+    .subchat-list {
+      display:flex;
+      flex-direction:column;
+      gap:6px;
+      margin-top:6px;
+      padding-left:46px;
+      border-left:1px dashed rgba(255,255,255,0.2);
+    }
+    .subchat-row {
+      display:flex;
+      align-items:center;
+      gap:8px;
+      font-size:13px;
+    }
+    .subchat-icon {
+      width:22px;
+      height:22px;
+      border-radius:50%;
+      overflow:hidden;
+      flex-shrink:0;
+      background:radial-gradient(circle at 30% 20%, #555, #111);
+      display:flex;
+      align-items:center;
+      justify-content:center;
+      font-size:13px;
+      color:#bbb;
+    }
+    .subchat-row img.subchat-icon-img {
+      width:100%;
+      height:100%;
+      object-fit:cover;
+    }
+
+    .loading-row {
+      display:flex;
+      justify-content:center;
+      padding:20px 0;
+    }
+    .spinner {
+      width:24px;
+      height:24px;
+      border-radius:50%;
+      border:2px solid rgba(255,255,255,0.15);
+      border-top-color:rgba(255,255,255,0.7);
+      animation:spin .7s linear infinite;
+    }
+    @keyframes spin {
+      to { transform:rotate(360deg); }
+    }
+
+    .error-banner {
+      margin-top:12px;
+      padding:8px 10px;
+      border-radius:8px;
+      border:1px solid rgba(248,113,113,0.4);
+      background:rgba(127,29,29,0.4);
+      font-size:12px;
+      color:#fecaca;
+    }
+
+    /* Modal */
+    .modal-overlay {
+      position:fixed;
+      inset:0;
+      background:rgba(0,0,0,.6);
+      display:none;
+      align-items:center;
+      justify-content:center;
+      z-index:50;
+    }
+    .modal-overlay.open {
+      display:flex;
+    }
+    .modal {
+      width:min(420px, 94vw);
+      border-radius:18px;
+      border:1px solid rgba(255,255,255,0.16);
+      background:radial-gradient(circle at top left, rgba(255,255,255,0.07), #020617);
+      box-shadow:0 18px 50px rgba(0,0,0,.75);
+      padding:18px 18px 16px;
+    }
+    .modal-header {
+      display:flex;
+      align-items:center;
+      gap:10px;
+      margin-bottom:12px;
+    }
+    .modal-chat {
+      display:flex;
+      align-items:center;
+      gap:8px;
+      min-width:0;
+      flex:1;
+    }
+    .modal-avatar, .modal-parent-avatar, .modal-subchat-icon {
+      width:32px;
+      height:32px;
+      border-radius:50%;
+      overflow:hidden;
+      background:radial-gradient(circle at 30% 20%, #555, #111);
+      display:flex;
+      align-items:center;
+      justify-content:center;
+      font-size:14px;
+      color:#bbb;
+      flex-shrink:0;
+    }
+    .modal-chat-title {
+      font-size:14px;
+      white-space:nowrap;
+      overflow:hidden;
+      text-overflow:ellipsis;
+    }
+    .modal-dot {
+      width:6px;
+      height:6px;
+      border-radius:50%;
+      background:#6b7280;
+      flex-shrink:0;
+    }
+    .modal-close {
+      border:none;
+      background:transparent;
+      color:#9ca3af;
+      cursor:pointer;
+      font-size:16px;
+    }
+    .modal-close:hover {
+      color:#e5e7eb;
+    }
+    .modal-section-title {
+      font-size:12px;
+      text-transform:uppercase;
+      letter-spacing:.06em;
+      opacity:.7;
+      margin:6px 0 8px;
+    }
+    .toggle-list {
+      display:flex;
+      flex-direction:column;
+      gap:8px;
+      margin-bottom:12px;
+    }
+    .toggle-row {
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      gap:10px;
+      padding:4px 8px;
+      border-radius:999px;
+      cursor:pointer;
+      border:1px solid transparent;
+      transition:background .15s ease, border-color .15s ease;
+    }
+    .toggle-row:hover {
+      background:rgba(15,23,42,0.9);
+      border-color:rgba(148,163,184,0.6);
+    }
+    .toggle-label {
+      font-size:13px;
+    }
+    .toggle-control {
+      position:relative;
+      width:42px;
+      height:22px;
+      border-radius:999px;
+      background:#111827;
+      border:1px solid #374151;
+      flex-shrink:0;
+    }
+    .toggle-knob {
+      position:absolute;
+      top:1px;
+      left:1px;
+      width:18px;
+      height:18px;
+      border-radius:50%;
+      background:#9ca3af;
+      transition:transform .18s ease, background .18s ease;
+    }
+    .toggle-control.on {
+      background:#064e3b;
+      border-color:#22c55e;
+    }
+    .toggle-control.on .toggle-knob {
+      transform:translateX(18px);
+      background:#bbf7d0;
+    }
+    .modal-footer {
+      display:flex;
+      justify-content:flex-end;
+      gap:8px;
+      margin-top:4px;
+    }
+  </style>
+</head>
+<body>
+<div class="page">
+  <header class="header">
+    <div>
+      <div class="title">Telegram Smart Search</div>
+      <div class="subtitle">Configure which sources we track per chat. Changes apply instantly via Redis.</div>
+    </div>
+    <div class="pill">Dark panel · Lazy-loaded · Live config</div>
+  </header>
+
+  <div id="error" class="error-banner" style="display:none;"></div>
+
+  <div id="chat-list" class="chat-list">
+    <!-- rows inserted by JS -->
+  </div>
+
+  <div id="loading-row" class="loading-row" style="display:none;">
+    <div class="spinner"></div>
+  </div>
+</div>
+
+<!-- Modal -->
+<div id="modal-overlay" class="modal-overlay">
+  <div class="modal">
+    <div class="modal-header">
+      <div id="modal-chat-visual" class="modal-chat">
+        <!-- filled via JS -->
+      </div>
+      <button id="modal-close" class="modal-close" aria-label="Close">✕</button>
+    </div>
+    <div class="modal-section-title">Tracking sources</div>
+    <div id="toggle-list" class="toggle-list">
+      <!-- toggles created by JS -->
+    </div>
+    <div class="modal-footer">
+      <button id="modal-save" class="btn btn-primary">Save</button>
+    </div>
+  </div>
+</div>
+
+<script>
+  const PAGE_SIZE = {{ page_size|default:20 }};
+  let CHAT_ORDER = [];
+  let META = {};
+  let loadedCount = 0;
+  let isLoading = false;
+  let reachedEnd = false;
+
+  const currentConfig = {};  // chat_key -> config
+  const chatEntries = {};    // entry_id -> data from /api/batch
+  const subchatByKey = {};   // topic chat_key -> metadata inc parent info
+
+  const chatListEl = document.getElementById("chat-list");
+  const loadingRowEl = document.getElementById("loading-row");
+  const errorEl = document.getElementById("error");
+
+  function setError(msg) {
+    if (!msg) {
+      errorEl.style.display = "none";
+      return;
+    }
+    errorEl.textContent = msg;
+    errorEl.style.display = "block";
+  }
+
+  function sourceIcon(label, active) {
+    const el = document.createElement("div");
+    el.className = "source-icon" + (active ? " active" : "");
+    el.textContent = label;
+    return el;
+  }
+
+  function buildSourcesRow(cfg) {
+    const row = document.createElement("div");
+    row.className = "sources-row";
+
+    row.appendChild(sourceIcon("T", !!cfg.track_text));
+    row.appendChild(sourceIcon("I", !!cfg.track_image));
+    row.appendChild(sourceIcon("V", !!cfg.track_video));
+    row.appendChild(sourceIcon("A", !!cfg.track_audio));
+    row.appendChild(sourceIcon("F", !!cfg.track_files));
+
+    return row;
+  }
+
+  function avatarFallbackChar(title) {
+    if (!title) return "?";
+    const t = title.trim();
+    return t ? t[0].toUpperCase() : "?";
+  }
+
+  function countTracked(cfg) {
+    let c = 0;
+    if (cfg.track_text) c++;
+    if (cfg.track_image) c++;
+    if (cfg.track_video) c++;
+    if (cfg.track_audio) c++;
+    if (cfg.track_files) c++;
+    return c;
+  }
+
+  function renderChatRow(entry, meta) {
+    const row = document.createElement("div");
+    row.className = "chat-row";
+    row.dataset.entryId = entry.entry_id;
+
+    const m = meta || {};
+    if (m.is_new) row.classList.add("new");
+
+    // avatar
+    const avatarWrap = document.createElement("div");
+    avatarWrap.className = "avatar-wrap";
+    if (entry.avatar_url) {
+      const img = document.createElement("img");
+      img.className = "avatar";
+      img.src = entry.avatar_url;
+      img.alt = "";
+      avatarWrap.appendChild(img);
+    } else {
+      avatarWrap.textContent = avatarFallbackChar(entry.title);
+    }
+
+    // middle
+    const main = document.createElement("div");
+    main.className = "chat-main";
+
+    const titleEl = document.createElement("div");
+    titleEl.className = "chat-title";
+    titleEl.textContent = entry.title;
+
+    const metaRow = document.createElement("div");
+    metaRow.className = "chat-meta";
+
+    const typeBadge = document.createElement("span");
+    typeBadge.className = "badge";
+    typeBadge.textContent = entry.chat_type;
+    metaRow.appendChild(typeBadge);
+
+    const trackedSpan = document.createElement("span");
+    const trackedCount = (m.tracked_sources_count != null) ? m.tracked_sources_count : countTracked(entry.config || {});
+    trackedSpan.textContent = `${trackedCount} tracked`;
+    metaRow.appendChild(trackedSpan);
+
+    main.appendChild(titleEl);
+    main.appendChild(metaRow);
+
+    // right side (edit or dropdown)
+    const right = document.createElement("div");
+    right.style.display = "flex";
+    right.style.flexDirection = "column";
+    right.style.alignItems = "flex-end";
+    right.style.gap = "6px";
+
+    if (entry.chat_type === "matryoshka_group") {
+      const toggle = document.createElement("div");
+      toggle.className = "matryoshka-toggle";
+      const arrow = document.createElement("div");
+      arrow.className = "matryoshka-arrow";
+      arrow.textContent = "›";
+      toggle.appendChild(arrow);
+
+      const label = document.createElement("span");
+      label.style.fontSize = "12px";
+      label.style.opacity = ".8";
+      label.textContent = "Subchats";
+      toggle.appendChild(label);
+
+      right.appendChild(toggle);
+
+      const subList = document.createElement("div");
+      subList.className = "subchat-list";
+      subList.style.display = "none";
+      right.appendChild(subList);
+
+      toggle.addEventListener("click", () => {
+        const isOpen = subList.style.display === "block";
+        subList.style.display = isOpen ? "none" : "block";
+        arrow.classList.toggle("open", !isOpen);
+
+        if (!isOpen && subList.childElementCount === 0) {
+          // render subchats
+          (entry.subchats || []).forEach(sub => {
+            subchatByKey[sub.chat_key] = {
+              ...sub,
+              parent_title: entry.title,
+              parent_avatar_url: entry.avatar_url,
+            };
+            const subRow = document.createElement("div");
+            subRow.className = "subchat-row";
+            subRow.dataset.chatKey = sub.chat_key;
+
+            const icon = document.createElement("div");
+            icon.className = "subchat-icon";
+            if (sub.icon_url) {
+              const img = document.createElement("img");
+              img.className = "subchat-icon-img";
+              img.src = sub.icon_url;
+              icon.appendChild(img);
+            } else {
+              icon.textContent = avatarFallbackChar(sub.title);
+            }
+
+            const title = document.createElement("div");
+            title.style.flex = "1";
+            title.style.minWidth = "0";
+            title.style.whiteSpace = "nowrap";
+            title.style.textOverflow = "ellipsis";
+            title.style.overflow = "hidden";
+            title.textContent = sub.title;
+
+            const srcRow = buildSourcesRow(sub.config);
+            srcRow.style.fontSize = "11px";
+            srcRow.dataset.sourcesFor = sub.chat_key;
+
+            const editBtn = document.createElement("button");
+            editBtn.className = "btn";
+            editBtn.textContent = "Edit";
+
+            editBtn.addEventListener("click", () => {
+              openModalForChat({
+                type: "topic",
+                chat_key: sub.chat_key,
+                config: sub.config,
+                parent_title: entry.title,
+                parent_avatar_url: entry.avatar_url,
+                subchat_title: sub.title,
+                subchat_icon_url: sub.icon_url,
+              });
+            });
+
+            subRow.appendChild(icon);
+            subRow.appendChild(title);
+            subRow.appendChild(srcRow);
+            subRow.appendChild(editBtn);
+
+            subList.appendChild(subRow);
+
+            currentConfig[sub.chat_key] = sub.config;
+          });
+        }
+      });
+
+    } else {
+      const srcRow = buildSourcesRow(entry.config);
+      srcRow.dataset.sourcesFor = entry.chat_key;
+      main.appendChild(srcRow);
+
+      const editBtn = document.createElement("button");
+      editBtn.className = "btn";
+      editBtn.textContent = "Edit";
+
+      editBtn.addEventListener("click", () => {
+        openModalForChat({
+          type: "peer",
+          chat_key: entry.chat_key,
+          config: entry.config,
+          title: entry.title,
+          avatar_url: entry.avatar_url,
+        });
+      });
+
+      right.appendChild(editBtn);
+    }
+
+    row.appendChild(avatarWrap);
+    row.appendChild(main);
+    row.appendChild(right);
+
+    // save config
+    currentConfig[entry.chat_key] = entry.config;
+
+    return row;
+  }
+
+  // ---------- modal ----------
+
+  const modalOverlay = document.getElementById("modal-overlay");
+  const modalChatVisual = document.getElementById("modal-chat-visual");
+  const modalSave = document.getElementById("modal-save");
+  const modalClose = document.getElementById("modal-close");
+  const toggleListEl = document.getElementById("toggle-list");
+
+  let modalState = null;
+
+  function clearModal() {
+    modalChatVisual.innerHTML = "";
+    toggleListEl.innerHTML = "";
+    modalState = null;
+  }
+
+  function createToggleRow(label, field, initial) {
+    const row = document.createElement("div");
+    row.className = "toggle-row";
+
+    const lab = document.createElement("div");
+    lab.className = "toggle-label";
+    lab.textContent = label;
+
+    const control = document.createElement("div");
+    control.className = "toggle-control" + (initial ? " on" : "");
+    const knob = document.createElement("div");
+    knob.className = "toggle-knob";
+    control.appendChild(knob);
+
+    row.appendChild(lab);
+    row.appendChild(control);
+
+    row.addEventListener("click", () => {
+      control.classList.toggle("on");
+    });
+
+    return {row, control};
+  }
+
+  function openModalForChat(opts) {
+    clearModal();
+
+    modalState = {
+      chat_key: opts.chat_key,
+      type: opts.type,
+      originalConfig: {...opts.config},
+    };
+
+    // header visuals
+    if (opts.type === "topic") {
+      const parentAvatar = document.createElement("div");
+      parentAvatar.className = "modal-parent-avatar";
+      if (opts.parent_avatar_url) {
+        const img = document.createElement("img");
+        img.src = opts.parent_avatar_url;
+        img.style.width = "100%";
+        img.style.height = "100%";
+        img.style.objectFit = "cover";
+        parentAvatar.appendChild(img);
+      } else {
+        parentAvatar.textContent = avatarFallbackChar(opts.parent_title);
+      }
+
+      const dot = document.createElement("div");
+      dot.className = "modal-dot";
+
+      const subIcon = document.createElement("div");
+      subIcon.className = "modal-subchat-icon";
+      if (opts.subchat_icon_url) {
+        const img = document.createElement("img");
+        img.src = opts.subchat_icon_url;
+        img.style.width = "100%";
+        img.style.height = "100%";
+        img.style.objectFit = "cover";
+        subIcon.appendChild(img);
+      } else {
+        subIcon.textContent = avatarFallbackChar(opts.subchat_title);
+      }
+
+      const titlesBox = document.createElement("div");
+      titlesBox.style.display = "flex";
+      titlesBox.style.flexDirection = "column";
+      titlesBox.style.minWidth = "0";
+
+      const parentTitle = document.createElement("div");
+      parentTitle.style.fontSize = "12px";
+      parentTitle.style.opacity = ".7";
+      parentTitle.textContent = opts.parent_title;
+
+      const subTitle = document.createElement("div");
+      subTitle.className = "modal-chat-title";
+      subTitle.textContent = opts.subchat_title;
+
+      titlesBox.appendChild(parentTitle);
+      titlesBox.appendChild(subTitle);
+
+      modalChatVisual.appendChild(parentAvatar);
+      modalChatVisual.appendChild(dot);
+      modalChatVisual.appendChild(subIcon);
+      modalChatVisual.appendChild(titlesBox);
+
+    } else {
+      const avatar = document.createElement("div");
+      avatar.className = "modal-avatar";
+      if (opts.avatar_url) {
+        const img = document.createElement("img");
+        img.src = opts.avatar_url;
+        img.style.width = "100%";
+        img.style.height = "100%";
+        img.style.objectFit = "cover";
+        avatar.appendChild(img);
+      } else {
+        avatar.textContent = avatarFallbackChar(opts.title);
+      }
+
+      const title = document.createElement("div");
+      title.className = "modal-chat-title";
+      title.textContent = opts.title;
+
+      modalChatVisual.appendChild(avatar);
+      modalChatVisual.appendChild(title);
+    }
+
+    // toggles
+    const cfg = opts.config;
+
+    const toggleSpecs = [
+      { field: "track_text", label: "Text" },
+      { field: "track_image", label: "Images" },
+      { field: "track_video", label: "Video" },
+      { field: "track_audio", label: "Audio" },
+      { field: "track_files", label: "Files" },
+    ];
+
+    const toggles = {};
+    toggleSpecs.forEach(spec => {
+      const t = createToggleRow(spec.label, spec.field, !!cfg[spec.field]);
+      toggleListEl.appendChild(t.row);
+      toggles[spec.field] = t.control; // important: map by field name
+    });
+    modalState.toggles = toggles;
+
+    modalOverlay.classList.add("open");
+  }
+
+  function closeModal() {
+    modalOverlay.classList.remove("open");
+    clearModal();
+  }
+
+  modalClose.addEventListener("click", closeModal);
+  modalOverlay.addEventListener("click", (e) => {
+    if (e.target === modalOverlay) closeModal();
+  });
+
+  function updatePeerUI(chatKey, cfg) {
+    const row = document.querySelector('.chat-row[data-entry-id="' + chatKey + '"]');
+    if (!row) return;
+
+    const sourcesEl = row.querySelector('[data-sources-for="' + chatKey + '"]');
+    if (sourcesEl) {
+      const newSources = buildSourcesRow(cfg);
+      newSources.dataset.sourcesFor = chatKey;
+      sourcesEl.replaceWith(newSources);
+    }
+
+    const trackedCount = countTracked(cfg);
+    const meta = META[chatKey] || {};
+    meta.tracked_sources_count = trackedCount;
+    meta.is_new = false;
+    META[chatKey] = meta;
+
+    const metaRow = row.querySelector(".chat-meta");
+    if (metaRow) {
+      const spans = metaRow.querySelectorAll("span");
+      if (spans.length >= 2) {
+        spans[1].textContent = `${trackedCount} tracked`;
+      } else if (spans.length === 1) {
+        const trackedSpan = document.createElement("span");
+        trackedSpan.textContent = `${trackedCount} tracked`;
+        metaRow.appendChild(trackedSpan);
+      }
+    }
+
+    row.classList.remove("new");
+  }
+
+  function updateTopicUI(chatKey, cfg) {
+    const subRow = document.querySelector('.subchat-row[data-chat-key="' + chatKey + '"]');
+    if (!subRow) return;
+
+    const sourcesEl = subRow.querySelector('[data-sources-for="' + chatKey + '"]');
+    if (sourcesEl) {
+      const newSources = buildSourcesRow(cfg);
+      newSources.style.fontSize = "11px";
+      newSources.dataset.sourcesFor = chatKey;
+      sourcesEl.replaceWith(newSources);
+    }
+
+    if (subchatByKey[chatKey]) {
+      subchatByKey[chatKey].config = cfg;
+    }
+  }
+
+  modalSave.addEventListener("click", async () => {
+    if (!modalState) return;
+    const k = modalState.chat_key;
+    const cfg = {
+      track_text:  modalState.toggles.track_text.classList.contains("on"),
+      track_image: modalState.toggles.track_image.classList.contains("on"),
+      track_video: modalState.toggles.track_video.classList.contains("on"),
+      track_audio: modalState.toggles.track_audio.classList.contains("on"),
+      track_files: modalState.toggles.track_files.classList.contains("on"),
+    };
+
+    const before = modalState.originalConfig;
+    const changed =
+      cfg.track_text  !== before.track_text  ||
+      cfg.track_image !== before.track_image ||
+      cfg.track_video !== before.track_video ||
+      cfg.track_audio !== before.track_audio ||
+      cfg.track_files !== before.track_files;
+
+    if (!changed) {
+      closeModal();
+      return;
+    }
+
+    try {
+      const resp = await fetch("/api/chat-config", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({chat_key: k, ...cfg}),
+      });
+      if (!resp.ok) {
+        setError("Failed to save config");
+        return;
+      }
+      const data = await resp.json();
+      if (!data.ok) {
+        setError("Backend rejected config");
+        return;
+      }
+
+      currentConfig[k] = cfg;
+
+      if (modalState.type === "peer") {
+        updatePeerUI(k, cfg);
+      } else if (modalState.type === "topic") {
+        updateTopicUI(k, cfg);
+      }
+
+      closeModal();
+    } catch (err) {
+      console.error(err);
+      setError("Network error while saving config");
+    }
+  });
+
+  // ---------- loading / infinite scroll ----------
+
+  async function loadBootstrap() {
+    setError("");
+    try {
+      const resp = await fetch("/api/bootstrap");
+      if (!resp.ok) {
+        setError("Failed to load chats list");
+        return;
+      }
+      const data = await resp.json();
+      CHAT_ORDER = data.chat_order || [];
+      META = data.meta || {};
+      loadedCount = 0;
+      reachedEnd = CHAT_ORDER.length === 0;
+
+      if (!reachedEnd) {
+        await loadNextBatch();
+      }
+    } catch (err) {
+      console.error(err);
+      setError("Network error during bootstrap");
+    }
+  }
+
+  async function loadNextBatch() {
+    if (isLoading || reachedEnd) return;
+    if (loadedCount >= CHAT_ORDER.length) {
+      reachedEnd = true;
+      return;
+    }
+    isLoading = true;
+    loadingRowEl.style.display = "block";
+
+    const slice = CHAT_ORDER.slice(loadedCount, loadedCount + PAGE_SIZE);
+    loadedCount += slice.length;
+
+    try {
+      const resp = await fetch("/api/batch", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({chat_ids: slice}),
+      });
+      if (!resp.ok) {
+        setError("Failed to load batch");
+        return;
+      }
+      const data = await resp.json();
+      (data.chats || []).forEach(entry => {
+        chatEntries[entry.entry_id] = entry;
+        const meta = META[entry.entry_id] || {};
+        const row = renderChatRow(entry, meta);
+        chatListEl.appendChild(row);
+      });
+
+      if (loadedCount >= CHAT_ORDER.length) {
+        reachedEnd = true;
+      }
+
+    } catch (err) {
+      console.error(err);
+      setError("Network error when loading batch");
+    } finally {
+      isLoading = false;
+      loadingRowEl.style.display = "none";
+    }
+  }
+
+  window.addEventListener("scroll", () => {
+    const nearBottom = window.innerHeight + window.scrollY >= document.body.offsetHeight - 200;
+    if (nearBottom) {
+      loadNextBatch();
+    }
+  });
+
+  loadBootstrap();
+</script>
+</body>
+</html>
+```
+
+---
+
+## 4) `client.py` (Telethon worker)
+
+Full file with:
+
+* BOT_TOKEN parsing and ignoring messages from that bot (point 4).
+* Cleaner `get_peer_id` usage.
+* Everything else as before.
+
+```python
+import asyncio
+import json
+import os
+import pathlib
+from typing import Any, Dict
+
+from dotenv import load_dotenv
+
+from telethon import TelegramClient, events, utils
+from telethon.utils import get_peer_id
+from telethon.tl.types import PeerChannel, PeerChat, PeerUser
+
+import redis.asyncio as aioredis
+
+BASE_DIR = pathlib.Path(__file__).resolve().parents[0]
+load_dotenv(dotenv_path=str(BASE_DIR / ".env"))
+
+CLIENT_APP_API_ID = int(os.getenv("CLIENT_APP_API_ID"))
+CLIENT_APP_API_HASH = os.getenv("CLIENT_APP_API_HASH")
+SESSION_PATH = str(BASE_DIR / "base_session.session")
+
+REDIS_URL = os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0")
+CONFIG_KEY = "smartsearch:tracking-config"
+CONFIG_CHANNEL = "smartsearch:config-updates"
+
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+BOT_USER_ID = None
+if BOT_TOKEN:
+    try:
+        BOT_USER_ID = int(BOT_TOKEN.split(":", 1)[0])
+    except (ValueError, IndexError):
+        BOT_USER_ID = None
+
+config: Dict[str, Any] = {"chats": {}}
+
+
+def _peer_config_key_from_event(event: events.NewMessage.Event) -> str:
+    """
+    Map Telethon event to our config key.
+    - For regular chats: peer:<peer_id>
+    - For forum topics: topic:<peer_id>:<topic_id>
+    """
+    msg = event.message
+    peer = msg.peer_id or msg.to_id
+    base_peer_id = get_peer_id(peer)
+
+    topic_id = None
+    if getattr(msg, "reply_to", None) and getattr(msg.reply_to, "forum_topic_id", None):
+        topic_id = msg.reply_to.forum_topic_id
+
+    if topic_id is not None:
+        return f"topic:{base_peer_id}:{topic_id}"
+    return f"peer:{base_peer_id}"
+
+
+def _detect_source_kind(event: events.NewMessage.Event) -> str:
+    msg = event.message
+    if msg.photo:
+        return "image"
+    if msg.video or (msg.document and getattr(msg.document, "mime_type", "").startswith("video/")):
+        return "video"
+    if msg.voice or msg.audio:
+        return "audio"
+    if msg.document:
+        mt = getattr(msg.document, "mime_type", "") or ""
+        if not mt.startswith("audio/") and not mt.startswith("video/"):
+            return "file"
+    return "text"
+
+
+def should_track(event: events.NewMessage.Event) -> bool:
+    msg = event.message
+    peer = msg.peer_id or msg.to_id
+    base_peer_id = get_peer_id(peer)
+
+    # Never track our own bot (search bot) – prevents loops
+    if BOT_USER_ID is not None and base_peer_id == BOT_USER_ID:
+        return False
+
+    key = _peer_config_key_from_event(event)
+    cfg = config.get("chats", {}).get(key)
+    if not cfg:
+        # No entry => default is "track nothing"
+        return False
+
+    kind = _detect_source_kind(event)
+    if kind == "text":
+        return cfg.get("track_text", False)
+    if kind == "image":
+        return cfg.get("track_image", False)
+    if kind == "video":
+        return cfg.get("track_video", False)
+    if kind == "audio":
+        return cfg.get("track_audio", False)
+    if kind == "file":
+        return cfg.get("track_files", False)
+    return False
+
+
+async def load_config_from_redis(r: aioredis.Redis) -> None:
+    global config
+    raw = await r.get(CONFIG_KEY)
+    if not raw:
+        config = {"chats": {}}
+        return
+    try:
+        config = json.loads(raw.decode("utf-8"))
+    except Exception:
+        config = {"chats": {}}
+
+
+async def watch_config_updates(r: aioredis.Redis) -> None:
+    pubsub = r.pubsub()
+    await pubsub.subscribe(CONFIG_CHANNEL)
+    async for message in pubsub.listen():
+        if message.get("type") != "message":
+            continue
+        await load_config_from_redis(r)
+
+
+async def main() -> None:
+    r = aioredis.from_url(REDIS_URL)
+    await load_config_from_redis(r)
+
+    client = TelegramClient(SESSION_PATH, CLIENT_APP_API_ID, CLIENT_APP_API_HASH)
+
+    @client.on(events.NewMessage)
+    async def handle_new_message(event: events.NewMessage.Event):
+        if not should_track(event):
+            return
+        # Here goes your logic that actually handles tracked messages
+        print("TRACKED:", event.chat_id, event.id, _detect_source_kind(event))
+
+    watcher_task = asyncio.create_task(watch_config_updates(r))
+
+    async with client:
+        await client.run_until_disconnected()
+
+    watcher_task.cancel()
+    try:
+        await watcher_task
+    except asyncio.CancelledError:
+        pass
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+---
+
+If anything behaves weird (e.g., Saved Messages not showing the custom icon, new-chats behavior not exactly as you want), send me:
+
+* One example chat_order/meta payload from `/api/bootstrap`,
+* One `/api/batch` response snippet,
+
+and I’ll tweak sorting / flags accordingly.

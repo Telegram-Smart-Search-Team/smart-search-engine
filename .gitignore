@@ -214,3 +214,13 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+
+# ----------------------------------------------- Project Specific -----------------------------------------------
+
+# Telethon session
+base_session.session
+config_panel_session.session
+
+# Logs
+logs

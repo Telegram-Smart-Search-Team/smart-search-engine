@@ -1,0 +1,38 @@
+[project]
+name = "smart-search-engine"
+version = "0.1.0"
+description = "Turn your Telegram history into a private, semantic, multimodal knowledge base."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "aiohttp>=3.13.2",
+    "asyncpg>=0.30.0",
+    "cairosvg>=2.8.2",
+    "django>=5.0,<6.0",
+    "lottie>=0.7.2",
+    "pgvector>=0.4.1",
+    "pillow>=10.0.0",
+    "psycopg[binary]>=3.2.12",
+    "python-dotenv>=1.2.1",
+    "redis[hiredis]>=5.0.0",
+    "ruff>=0.14.3",
+    "telethon>=1.42.0",
+]
+
+[tool.ruff]
+lint.select = ["E4", "E7", "E9", "F"]
+lint.ignore = ["E402"]
+
+# Automatic fixes
+lint.fixable = ["A", "B", "C", "D", "E", "F", "G", "I", "N", "Q", "S", "T", "U", "W", "ANN", "ARG", "BLE", "COM", "DJ", "DTZ", "EM", "EXE", "FBT", "ICN", "INP", "ISC", "NPY", "PD", "PGH", "PIE", "PL", "PT", "PTH", "PYI", "RET", "RSE", "RUF", "SIM", "SLF", "TCH", "TID", "TRY", "UP", "YTT", "FIX", "RUF100"]
+
+line-length = 120
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[dependency-groups]
+dev = [
+    "pre-commit>=4.3.0",
+]
