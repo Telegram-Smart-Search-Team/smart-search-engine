@@ -218,22 +218,5 @@ __marimo__/
 
 # ----------------------------------------------- Project Specific -----------------------------------------------
 
-# Telethon session
-base_session.session*
-config_panel_session.session*
-bot_session.session*
-
 # Logs
 logs
-
-# Test
-src/test
-
-# Dump
-dump
-
-# Media
-src/web/config_site/media/telegram_media
-
-# Git
-.git-other

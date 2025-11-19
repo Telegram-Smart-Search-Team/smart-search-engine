@@ -1,22 +1,9 @@
-![logo](pictures/logo.png)
-
-# Telegram Smart Search
-
-Turn your Telegram history into a private, semantic, multimodal knowledge base. Text, images, voice notes, and files become searchable by meaning — with a local privacy layer that masks sensitive data before anything is embedded or stored.
-
-## What this project does:
-- **Ingests** all incoming Telegram messages (text, images, audio, files).
-- **Normalizes** content (internal Qwen for images, video and pdfs, transcription for audio).
-- **Masks** sensitive strings locally (passwords, tokens, secrets) before sending outside.
-- **Embeds** messages and **stores** them with metadata in a vector-backed database.
-- **Retrieves** the most relevant messages by semantic similarity and reranks them for a final answer.
-
-## Installation Guide
+# Installation Guide
 
 
-### Python & Environment
+## Python & Environment
 
-#### 1. Package Manager
+### 1. Package Manager
 We use modern [uv](https://github.com/astral-sh/uv) for managing python packages.
 
 To install it run:
@@ -32,7 +19,7 @@ uv --version
 ```
 (you should see something like <span style="color:#f2c94c; background:rgba(242, 201, 76, 0.05); padding: 2px 5px; border-radius: 6px;">uv 0.9.9</span>)
 
-#### 2. Python
+### 2. Python
 We use `Python 3.12`. You can try other Python versions, but we recommend installing `Python 3.12`, as the project was tested with it. You can do it using:
 ```
 uv python install 3.12
@@ -40,7 +27,7 @@ uv python list
 ```
 (this installs `CPython 3.12` into `uv`’s own directory under <span style="color:#6ee7b7; background:rgba(110, 231, 183, 0.05); padding: 2px 5px; border-radius: 6px;">~/.local/share/uv/python/...</span>)
 
-#### 3. Environment
+### 3. Environment
 It is time to create and activate a virtual environment.
 
 Move into the repo root:
@@ -55,16 +42,16 @@ uv sync
 (`uv` creates `.venv` directory)
 
 
-#### 4. Precommit (optional)
+### 4. Precommit (optional)
 If you ever want to collaborate, run:
 ```
 uv run pre-commit install
 ```
 
 
-### Database
+## Database
 
-#### 1. PostgreSQL
+### 1. PostgreSQL
 
 ```
 sudo apt install -y postgresql postgresql-contrib build-essential
@@ -82,7 +69,7 @@ sudo systemctl enable postgresql
 sudo systemctl start postgresql
 ```
 
-#### 2. pgvector
+### 2. pgvector
 
 It is required to install development headers to install `pgvector` (or there will be an error about `postgres.h` which is missing):
 ```
@@ -103,7 +90,7 @@ If everything is alright, you can clear the tmp:
 rm -rf /tmp/pgvector
 ```
 
-#### 3. Database & Users Creation
+### 3. Database & Users Creation
 
 Enter Postgres as the default `postgres` superuser:
 ```
@@ -143,9 +130,9 @@ psql -h localhost -U telegram_smart_search_user -d telegram_smart_search_databas
 ```
 
 
-### Client & Web Config
+## Client & Web Config
 
-#### 1. Linux Packages Installation
+### 1. Linux Packages Installation
 
 ```
 sudo apt install -y redis-server
@@ -161,24 +148,20 @@ Check that `redis` is working with:
 redis-cli ping  # PONG
 ```
 
-#### 2. Django Migrations (Optional)
+### 2. Django Migrations (Optional)
 ```
 uv run python manage.py migrate
 ```
 
-#### 3. Running
+### 3. Running
 ```
 uv run python3 manage.py runserver 0.0.0.0:8000
 ```
 
 
-### Bot
+## Bot
 
-#### 1. Running
+### 1. Running
 ```
 uv run src/bot/bot.py
 ```
-
-## Licence
-
-MIT
